@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tmp
+*.log
+
+# Planning files (dev only)
+task_plan.md
+findings.md
+progress.md
+review-report.md

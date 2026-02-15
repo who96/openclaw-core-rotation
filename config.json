@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "compactionCountThreshold": 3,
+  "injectionBudgetPercent": 0.15,
+  "recentMessagePairs": 5,
+  "oldSessionPolicy": "archive",
+  "notifyOnRotation": false,
+  "cooldown": {
+    "minCompactions": 3,
+    "minMinutes": 30
+  },
+  "circuitBreaker": {
+    "maxRotations": 3,
+    "windowMinutes": 30
+  }
+}

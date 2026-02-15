@@ -1,0 +1,29 @@
+{
+  "name": "core-rotation",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin that automatically rotates agent sessions when compaction-driven context degradation is detected, injecting inherited memory into fresh sessions.",
+  "license": "MIT",
+  "main": "dist/handler.js",
+  "types": "dist/handler.d.ts",
+  "files": [
+    "dist/",
+    "HOOK.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/__tests__/*.test.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/handler.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.4.0"
+  }
+}

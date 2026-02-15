@@ -1,0 +1,32 @@
+{
+  "id": "core-rotation",
+  "name": "Core Rotation",
+  "description": "Automatic session rotation when compaction-driven context degradation is detected.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "compactionCountThreshold": { "type": "number" },
+      "injectionBudgetPercent": { "type": "number" },
+      "recentMessagePairs": { "type": "number" },
+      "oldSessionPolicy": { "type": "string", "enum": ["archive", "delete"] },
+      "notifyOnRotation": { "type": "boolean" },
+      "cooldown": {
+        "type": "object",
+        "properties": {
+          "minCompactions": { "type": "number" },
+          "minMinutes": { "type": "number" }
+        }
+      },
+      "circuitBreaker": {
+        "type": "object",
+        "properties": {
+          "maxRotations": { "type": "number" },
+          "windowMinutes": { "type": "number" }
+        }
+      }
+    }
+  }
+}
