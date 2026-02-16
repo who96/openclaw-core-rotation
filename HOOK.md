@@ -1,13 +1,13 @@
 ---
 name: core-rotation
-description: >
-  Automatically rotates agent sessions when compaction count exceeds a
-  configurable threshold, preventing cumulative context degradation.
-  Archives the old session, creates a fresh one, and injects inherited
-  memory (MEMORY.md, daily logs, recent messages) into the new session.
-events:
-  - after_compaction
-  - gateway:startup
+description: "Automatic session rotation on compaction-driven context degradation"
+metadata:
+  {
+    "openclaw":
+      {
+        "events": ["after_compaction", "gateway:startup"],
+      },
+  }
 ---
 
 # Core Rotation Hook
@@ -18,7 +18,7 @@ When an OpenClaw agent session undergoes repeated compaction (lossy context
 summarization), information quality degrades exponentially. This hook detects
 that degradation by counting compactions, then performs an automatic "core
 rotation": the old session is archived, a new session is created, and key
-state (long-term memory, daily logs, recent conversation) is injected into
+state (long-term memory, daily logs, recent messages) is injected into
 the fresh session.
 
 ## Events
@@ -35,6 +35,19 @@ breaker conditions allow it, the rotation process begins.
 Fires when the OpenClaw gateway process starts (or restarts). The plugin reads
 `rotation-state.json` and resumes any interrupted rotation from the last
 persisted state, or safely rolls back if recovery is not possible.
+
+## Installation
+
+The hook must be registered in the Gateway's managed hooks directory:
+
+```
+~/.openclaw/hooks/core-rotation/
+├── handler.js  -> symlink to local-plugins/core-rotation/hooks/core-rotation.js
+└── HOOK.md     (this file, with metadata.openclaw.events frontmatter)
+```
+
+**Important**: The `HOOK.md` frontmatter must use `metadata.openclaw.events`
+format (not top-level `events`), and the CJS bridge must export `.default`.
 
 ## Configuration
 
