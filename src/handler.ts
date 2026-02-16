@@ -8,111 +8,135 @@
  */
 
 import { readFileSync, writeFileSync, renameSync, copyFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve, basename } from 'path';
 import type {
   RotationConfig,
   RotationState,
   RotationStateName,
   AfterCompactionEvent,
   GatewayStartupEvent,
-  HookContext,
+  GatewayContext,
   InjectionPayload,
   MessagePair,
   RotationMetadata,
   RotationHistoryEntry,
-} from './types';
-import { DEFAULT_CONFIG, DEFAULT_STATE, VALID_TRANSITIONS } from './types';
+} from './types.ts';
+import { DEFAULT_CONFIG, DEFAULT_STATE, VALID_TRANSITIONS } from './types.ts';
+
+// ---------------------------------------------------------------------------
+// Helper: Derive Agent Directory
+// ---------------------------------------------------------------------------
+
+/**
+ * workspaceDir is a subdirectory of the agent root.
+ * Agent root (where `rotation-state.json` and `sessions/` live) is the parent.
+ */
+export function deriveAgentDir(ctx: Partial<GatewayContext>): string | null {
+  if (!ctx?.workspaceDir) return null;
+  return resolve(ctx.workspaceDir, '..');
+}
 
 // ---------------------------------------------------------------------------
 // Plugin Entry Point
 // ---------------------------------------------------------------------------
 
-export default function register(api: { on: (event: string, handler: (event: any) => void) => void }): void {
-  api.on('after_compaction', onAfterCompaction);
-  api.on('gateway:startup', onGatewayStartup);
+export default function register(api: { on: (event: string, handler: (...args: any[]) => void) => void }): void {
+  api.on('after_compaction', (event: any, ctx: any) => onAfterCompaction(event, ctx ?? {}));
+  api.on('gateway:startup', (event: any, ctx: any) => onGatewayStartup(event, ctx ?? {}));
 }
 
 // ---------------------------------------------------------------------------
 // Hook Handlers
 // ---------------------------------------------------------------------------
 
-export function onAfterCompaction(event: AfterCompactionEvent): void {
-  const config = loadConfig(event.context.agentDir);
+export function onAfterCompaction(event: AfterCompactionEvent, ctx: Partial<GatewayContext>): void {
+  // Defensive check first
+  const agentDir = deriveAgentDir(ctx);
+  if (!agentDir) return;
+
+  const config = loadConfig(agentDir);
   if (!config.enabled) return;
 
-  const state = readState(event.context.agentDir);
+  let state = readState(agentDir);
+
+  // Self-track cumulative compaction count
+  const cumulativeCount = state.cumulativeCompactionCount + 1;
+  // Update state on disk immediately (even if we don't rotate)
+  state = patchState(agentDir, state, { cumulativeCompactionCount: cumulativeCount });
 
   // If in COOLDOWN, check expiry
   if (state.state === 'COOLDOWN') {
     if (state.cooldownUntil && new Date(state.cooldownUntil) <= new Date()) {
-      writeState(event.context.agentDir, state, 'IDLE', { cooldownUntil: null });
+      writeState(agentDir, state, 'IDLE', { cooldownUntil: null });
     }
     return;
   }
 
   if (state.state !== 'IDLE') return;
 
-  // Check compaction threshold
-  const compactionCount = event.compactionCount ?? event.session?.compactionCount ?? 0;
-  if (compactionCount < config.compactionCountThreshold) return;
+  // Check compaction threshold using cumulative count
+  if (cumulativeCount < config.compactionCountThreshold) return;
 
   // Circuit breaker
   if (!checkCircuitBreaker(state, config)) return;
 
-  // Cooldown guard
-  if (isInCooldown(state, config, compactionCount)) return;
+  // Cooldown guard (pass cumulative count)
+  if (isInCooldown(state, config, cumulativeCount)) return;
 
-  // Active task check: look for pending tool_use without tool_result
-  const sessionFile = join(event.context.agentDir, 'sessions', `${event.context.sessionId}.jsonl`);
-  if (hasActiveTasks(sessionFile)) return;
+  // Active task check: use sessionFile from event
+  if (hasActiveTasks(event.sessionFile)) return;
 
   // All checks passed — rotate
-  rotate(config, event);
+  rotate(config, event, ctx, agentDir, cumulativeCount);
 }
 
-export function onGatewayStartup(event: GatewayStartupEvent): void {
-  const state = readState(event.context.agentDir);
+export function onGatewayStartup(event: GatewayStartupEvent, ctx: Partial<GatewayContext>): void {
+  // Defensive check
+  const agentDir = deriveAgentDir(ctx);
+  if (!agentDir) return;
+
+  const state = readState(agentDir);
 
   switch (state.state) {
     case 'IDLE':
       return;
 
     case 'PENDING':
-      writeState(event.context.agentDir, state, 'IDLE', {});
+      writeState(agentDir, state, 'IDLE', {});
       return;
 
     case 'ARCHIVING': {
       if (state.archivePath && state.oldSessionFile && validateArchive(state.archivePath, state.oldSessionFile)) {
-        writeState(event.context.agentDir, state, 'ARCHIVED', {});
+        writeState(agentDir, state, 'ARCHIVED', {});
       } else {
         // Cleanup partial archive
         if (state.archivePath) {
           try { unlinkSync(state.archivePath); } catch { /* file may already be gone */ }
         }
-        writeState(event.context.agentDir, state, 'PENDING', { archivePath: null });
+        writeState(agentDir, state, 'PENDING', { archivePath: null });
         // Fall back to IDLE — re-evaluate on next compaction
-        const updated = readState(event.context.agentDir);
-        writeState(event.context.agentDir, updated, 'IDLE', {});
+        const updated = readState(agentDir);
+        writeState(agentDir, updated, 'IDLE', {});
       }
       return;
     }
 
     case 'ARCHIVED': {
       // Safe recovery point — execute Phase 2
-      const config = loadConfig(event.context.agentDir);
-      rotatePhase2(config, event.context, readState(event.context.agentDir));
+      const config = loadConfig(agentDir);
+      rotatePhase2(config, ctx, agentDir, readState(agentDir));
       return;
     }
 
     case 'INJECTED': {
-      const config = loadConfig(event.context.agentDir);
-      finishRotation(event.context.agentDir, readState(event.context.agentDir), config);
+      const config = loadConfig(agentDir);
+      finishRotation(agentDir, readState(agentDir), config);
       return;
     }
 
     case 'COOLDOWN': {
       if (state.cooldownUntil && new Date(state.cooldownUntil) <= new Date()) {
-        writeState(event.context.agentDir, state, 'IDLE', { cooldownUntil: null });
+        writeState(agentDir, state, 'IDLE', { cooldownUntil: null });
       }
       return;
     }
@@ -123,9 +147,17 @@ export function onGatewayStartup(event: GatewayStartupEvent): void {
 // Rotation Logic
 // ---------------------------------------------------------------------------
 
-export function rotate(config: RotationConfig, event: AfterCompactionEvent): void {
-  const { agentDir, sessionId } = event.context;
-  const sessionFile = join(agentDir, 'sessions', `${sessionId}.jsonl`);
+export function rotate(
+  config: RotationConfig,
+  event: AfterCompactionEvent,
+  ctx: Partial<GatewayContext>,
+  agentDir: string,
+  cumulativeCount: number,
+): void {
+  const sessionFile = event.sessionFile;
+  // Extract sessionId from sessionFile path if ctx is sparse
+  const sessionId = ctx.sessionId ?? basename(sessionFile, '.jsonl');
+
   let state = readState(agentDir);
 
   // IDLE → PENDING
@@ -133,7 +165,7 @@ export function rotate(config: RotationConfig, event: AfterCompactionEvent): voi
     startedAt: new Date().toISOString(),
     oldSessionId: sessionId,
     oldSessionFile: sessionFile,
-    triggerCompactionCount: event.compactionCount,
+    triggerCompactionCount: cumulativeCount,
   });
 
   // Phase 1: ARCHIVE
@@ -157,26 +189,31 @@ export function rotate(config: RotationConfig, event: AfterCompactionEvent): voi
   state = writeState(agentDir, state, 'ARCHIVED', {});
 
   // Phase 2: RESET + INJECT
-  rotatePhase2(config, event.context, state);
+  rotatePhase2(config, ctx, agentDir, state);
 }
 
-function rotatePhase2(config: RotationConfig, ctx: HookContext, state: RotationState): void {
-  const payload = buildInjectionPayload(config, ctx, state);
+function rotatePhase2(
+  config: RotationConfig,
+  ctx: Partial<GatewayContext>,
+  agentDir: string,
+  state: RotationState,
+): void {
+  const payload = buildInjectionPayload(config, ctx, agentDir, state);
   const injectionMessage = formatInjectionMessage(payload);
 
   // Write injection content to a pickup file for OpenClaw
-  const injectionPath = join(ctx.agentDir, 'rotation-injection.md');
+  const injectionPath = join(agentDir, 'rotation-injection.md');
   writeFileSync(injectionPath, injectionMessage, 'utf-8');
 
   const newSessionId = `rotation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // ARCHIVED → INJECTED
-  state = writeState(ctx.agentDir, state, 'INJECTED', {
+  state = writeState(agentDir, state, 'INJECTED', {
     newSessionId,
     injectedTokensEstimate: payload.estimatedTokens,
   });
 
-  finishRotation(ctx.agentDir, state, config);
+  finishRotation(agentDir, state, config);
 }
 
 function finishRotation(agentDir: string, state: RotationState, config: RotationConfig): void {
@@ -205,23 +242,28 @@ function finishRotation(agentDir: string, state: RotationState, config: Rotation
 
 export function buildInjectionPayload(
   config: RotationConfig,
-  ctx: HookContext,
+  ctx: Partial<GatewayContext>,
+  agentDir: string,
   state: RotationState,
 ): InjectionPayload {
-  const memoryPath = join(ctx.workspaceDir, 'MEMORY.md');
+  // Use workspaceDir from ctx with fallback
+  const workspaceDir = ctx.workspaceDir ?? join(agentDir, 'workspace');
+
+  const memoryPath = join(workspaceDir, 'MEMORY.md');
   let longTermMemory = readFileOrEmpty(memoryPath);
 
   const today = new Date().toISOString().slice(0, 10);
   const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  let todayLog = readFileOrEmpty(join(ctx.workspaceDir, 'memory', `${today}.md`));
-  let yesterdayLog = readFileOrEmpty(join(ctx.workspaceDir, 'memory', `${yesterday}.md`));
+  let todayLog = readFileOrEmpty(join(workspaceDir, 'memory', `${today}.md`));
+  let yesterdayLog = readFileOrEmpty(join(workspaceDir, 'memory', `${yesterday}.md`));
 
   const sessionFile = state.oldSessionFile ?? '';
   let messagePairs = extractRecentMessages(sessionFile, config.recentMessagePairs);
 
   // Exponential backoff: reduce budget on consecutive rotations
   const backoffMultiplier = getBackoffMultiplier(state, config);
-  const tokenBudget = Math.floor(ctx.contextWindow * config.injectionBudgetPercent * backoffMultiplier);
+  // Use config.contextWindow instead of ctx.contextWindow
+  const tokenBudget = Math.floor(config.contextWindow * config.injectionBudgetPercent * backoffMultiplier);
 
   const metadata: RotationMetadata = {
     rotationNumber: state.rotationHistory.length + 1,
@@ -353,6 +395,29 @@ export function writeState(
     ...currentState,
     ...updates,
     state: newStateName,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const statePath = join(agentDir, 'rotation-state.json');
+  const tmpPath = statePath + '.tmp';
+  writeFileSync(tmpPath, JSON.stringify(newState, null, 2), 'utf-8');
+  renameSync(tmpPath, statePath);
+
+  return newState;
+}
+
+/**
+ * Update state fields without FSM transition check.
+ * Used for updating cumulativeCompactionCount without changing state.
+ */
+export function patchState(
+  agentDir: string,
+  currentState: RotationState,
+  updates: Partial<RotationState>,
+): RotationState {
+  const newState: RotationState = {
+    ...currentState,
+    ...updates,
     updatedAt: new Date().toISOString(),
   };
 

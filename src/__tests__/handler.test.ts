@@ -27,21 +27,24 @@ import {
   extractRecentMessages,
   readFileOrEmpty,
   getBackoffMultiplier,
-} from '../handler.js';
+  deriveAgentDir,
+  patchState,
+  onAfterCompaction,
+} from '../handler.ts';
 
 import {
   DEFAULT_STATE,
   DEFAULT_CONFIG,
   VALID_TRANSITIONS,
-} from '../types.js';
+} from '../types.ts';
 
 import type {
   RotationState,
   RotationConfig,
   RotationStateName,
-  HookContext,
+  GatewayContext,
   InjectionPayload,
-} from '../types.js';
+} from '../types.ts';
 
 // ---------------------------------------------------------------------------
 // Test Helpers
@@ -95,14 +98,14 @@ function makeState(overrides: Partial<RotationState> = {}): RotationState {
   };
 }
 
-/** Creates a HookContext. */
-function makeContext(overrides: Partial<HookContext> = {}): HookContext {
+/** Creates a GatewayContext. */
+function makeContext(overrides: Partial<GatewayContext> = {}): Partial<GatewayContext> {
   return {
     agentId: 'test-agent',
+    sessionKey: 'agent:test-agent:test:channel:123',
     sessionId: 'test-session',
-    agentDir: '/tmp/test',
     workspaceDir: '/tmp/test-ws',
-    contextWindow: 200_000,
+    messageProvider: 'test',
     ...overrides,
   };
 }
@@ -306,8 +309,8 @@ describe('Injection Payload Assembly', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    const ctx = makeContext({ agentDir, workspaceDir });
-    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, agentDir, state);
     assert.ok(payload.longTermMemory.includes('Long-term memory content here.'));
   });
 
@@ -325,8 +328,8 @@ describe('Injection Payload Assembly', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    const ctx = makeContext({ agentDir, workspaceDir });
-    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, agentDir, state);
     assert.ok(payload.todayLog.includes('Today log entry.'));
   });
 
@@ -347,8 +350,8 @@ describe('Injection Payload Assembly', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    const ctx = makeContext({ agentDir, workspaceDir });
-    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const payload = buildInjectionPayload(DEFAULT_CONFIG, ctx, agentDir, state);
     assert.equal(payload.recentMessages.length, 2);
     assert.equal(payload.recentMessages[0].user, 'first question');
     assert.equal(payload.recentMessages[1].assistant, 'second answer');
@@ -374,10 +377,10 @@ describe('Injection Payload Assembly', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    // Small context window so budget is tight
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 200_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15 };
-    const payload = buildInjectionPayload(config, ctx, state);
+    // contextWindow now in config, not ctx
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 200_000, injectionBudgetPercent: 0.15 };
+    const payload = buildInjectionPayload(config, ctx, agentDir, state);
     // Yesterday log should be dropped (empty) because it was over budget
     assert.equal(payload.yesterdayLog, '');
   });
@@ -401,9 +404,9 @@ describe('Injection Payload Assembly', () => {
       rotationHistory: [],
     });
     // Tight budget: 10K tokens
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 70_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
-    const payload = buildInjectionPayload(config, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 70_000, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
+    const payload = buildInjectionPayload(config, ctx, agentDir, state);
     // After step 2, pairs should be <= 3
     assert.ok(payload.recentMessages.length <= 3, `Expected <= 3 pairs, got ${payload.recentMessages.length}`);
   });
@@ -426,9 +429,9 @@ describe('Injection Payload Assembly', () => {
       rotationHistory: [],
     });
     // Very tight budget forces truncation of MEMORY.md
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 60_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15, recentMessagePairs: 1 };
-    const payload = buildInjectionPayload(config, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 60_000, injectionBudgetPercent: 0.15, recentMessagePairs: 1 };
+    const payload = buildInjectionPayload(config, ctx, agentDir, state);
     assert.ok(payload.longTermMemory.includes('[... truncated for token budget ...]'));
     assert.ok(payload.longTermMemory.length < bigMemory.length);
   });
@@ -453,9 +456,9 @@ describe('Injection Payload Assembly', () => {
       rotationHistory: [],
     });
     // Extremely tight budget to force step 4
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 20_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
-    const payload = buildInjectionPayload(config, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 20_000, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
+    const payload = buildInjectionPayload(config, ctx, agentDir, state);
     // Step 4: todayLog dropped, pairs reduced to 1
     assert.equal(payload.todayLog, '');
     assert.ok(payload.recentMessages.length <= 1, `Expected <= 1 pair, got ${payload.recentMessages.length}`);
@@ -484,9 +487,9 @@ describe('Injection Payload Assembly', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 200_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
-    const payload = buildInjectionPayload(config, ctx, state);
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 200_000, injectionBudgetPercent: 0.15, recentMessagePairs: 5 };
+    const payload = buildInjectionPayload(config, ctx, agentDir, state);
     const budget = Math.floor(200_000 * 0.15);
     assert.ok(
       payload.estimatedTokens <= budget,
@@ -1083,8 +1086,8 @@ describe('Exponential Backoff', () => {
       { role: 'assistant', content: 'a' },
     ]);
     const now = Date.now();
-    const ctx = makeContext({ agentDir, workspaceDir, contextWindow: 200_000 });
-    const config: RotationConfig = { ...DEFAULT_CONFIG, injectionBudgetPercent: 0.15 };
+    const ctx = makeContext({ workspaceDir });
+    const config: RotationConfig = { ...DEFAULT_CONFIG, contextWindow: 200_000, injectionBudgetPercent: 0.15 };
 
     // No history: full budget
     const stateNoHistory = makeState({
@@ -1094,7 +1097,7 @@ describe('Exponential Backoff', () => {
       archivePath: '/archive/sess-1.jsonl',
       rotationHistory: [],
     });
-    const payload1 = buildInjectionPayload(config, ctx, stateNoHistory);
+    const payload1 = buildInjectionPayload(config, ctx, agentDir, stateNoHistory);
 
     // 1 recent rotation: reduced budget
     const stateOneRecent = makeState({
@@ -1106,7 +1109,7 @@ describe('Exponential Backoff', () => {
         { rotatedAt: new Date(now - 5 * 60_000).toISOString(), oldSessionId: 's0', newSessionId: 's1', triggerCompactionCount: 3, injectedTokensEstimate: 100 },
       ],
     });
-    const payload2 = buildInjectionPayload(config, ctx, stateOneRecent);
+    const payload2 = buildInjectionPayload(config, ctx, agentDir, stateOneRecent);
 
     // The reduced budget payload should have <= the full budget payload's tokens
     // (they may be equal if the content is small enough to fit even the reduced budget)

@@ -47,6 +47,9 @@ export interface RotationState {
   /** The compactionCount value that triggered this rotation. */
   triggerCompactionCount: number | null;
 
+  /** Cumulative count of how many compactions have occurred (self-tracked). */
+  cumulativeCompactionCount: number;
+
   /** Append-only log of completed rotations. */
   rotationHistory: RotationHistoryEntry[];
 
@@ -117,6 +120,9 @@ export interface RotationConfig {
   /** Send a notification message to the user's channel on rotation. */
   notifyOnRotation: boolean;
 
+  /** The context window size in tokens (Gateway doesn't provide this). */
+  contextWindow: number;
+
   cooldown: CooldownConfig;
   circuitBreaker: CircuitBreakerConfig;
 }
@@ -132,6 +138,7 @@ export const DEFAULT_CONFIG: RotationConfig = {
   recentMessagePairs: 5,
   oldSessionPolicy: 'archive',
   notifyOnRotation: true,
+  contextWindow: 200_000,
   cooldown: {
     minCompactions: 3,
     minMinutes: 30,
@@ -156,6 +163,7 @@ export const DEFAULT_STATE: RotationState = {
   newSessionId: null,
   cooldownUntil: null,
   triggerCompactionCount: null,
+  cumulativeCompactionCount: 0,
   injectedTokensEstimate: null,
   rotationHistory: [],
   error: null,
@@ -180,56 +188,55 @@ export interface SessionEntry {
 }
 
 // ---------------------------------------------------------------------------
-// OpenClaw Hook Event Context
+// Gateway API Event Context
 // ---------------------------------------------------------------------------
 
 /**
- * Context object passed to hook handlers by the OpenClaw Plugin SDK.
- * Based on observed patterns from OpenClaw hook documentation and PR #14882.
+ * Context object passed by Gateway as the second parameter to hook handlers.
+ * IMPORTANT: ctx can be empty {} on some Gateway code paths.
  */
-export interface HookContext {
-  /** The agent ID this event belongs to. */
+export interface GatewayContext {
+  /** The agent ID this event belongs to (e.g. "agent"). */
   agentId: string;
 
-  /** ID of the current active session. */
-  sessionId: string;
+  /** Session key (e.g. "agent:dispatcher:discord:channel:..."). */
+  sessionKey: string;
 
-  /** Absolute path to the agent's data directory. */
-  agentDir: string;
+  /** Session UUID. */
+  sessionId: string;
 
   /** Absolute path to the workspace directory. */
   workspaceDir: string;
 
-  /** The context window size in tokens for the current model. */
-  contextWindow: number;
+  /** Message provider (e.g. "discord"). */
+  messageProvider: string;
 }
 
 /**
  * Event payload for `after_compaction`.
- * Contains the hook context plus compaction-specific data.
+ * Gateway handler signature: handler(event, ctx)
  */
 export interface AfterCompactionEvent {
-  hook: 'after_compaction';
-  context: HookContext;
+  /** Number of messages remaining after compaction. */
+  messageCount: number;
 
-  /** Current compaction count after this compaction completed. */
-  compactionCount: number;
+  /** Estimated tokens after compaction. */
+  tokenCount: number;
 
-  /** Session metadata snapshot at time of event. */
-  session: SessionEntry;
+  /** Number of messages REMOVED in this compaction (NOT cumulative). */
+  compactedCount: number;
+
+  /** Path to session transcript file. */
+  sessionFile: string;
 }
 
 /**
  * Event payload for `gateway:startup`.
- * Contains the hook context for crash recovery.
+ * Minimal interface - gateway:startup may pass minimal or no event data.
  */
 export interface GatewayStartupEvent {
-  hook: 'gateway:startup';
-  context: HookContext;
+  // Gateway startup passes minimal event data
 }
-
-/** Union of all events this plugin handles. */
-export type PluginEvent = AfterCompactionEvent | GatewayStartupEvent;
 
 // ---------------------------------------------------------------------------
 // Injection Payload
